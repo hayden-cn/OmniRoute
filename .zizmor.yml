@@ -97,8 +97,31 @@ rules:
     #
     # Accepted risk (first-party caching on trusted/isolated events), re-review at
     # the next release cycle (added 2026-06-16).
+    #   • build-release.yml — fork-operator PUBLISH workflow that triggers ONLY on
+    #     `workflow_dispatch` (never `pull_request` from a fork), so an untrusted
+    #     ref can never seed the npm/node_modules cache it restores. Same
+    #     first-party, lockfile-pinned key on trusted events as electron-release.
+    #
+    # Accepted risk (first-party caching on trusted/isolated events), re-review at
+    # the next release cycle (added 2026-08-07).
     ignore:
       - electron-release.yml
       - npm-publish.yml
       - opencode-plugin-ci.yml
       - opencode-provider-ci.yml
+      - build-release.yml
+
+  unpinned-uses:
+    # build-release.yml pins actions at major/minor version tags
+    # (actions/checkout@v7, actions/setup-node@v7, actions/cache@v6.1.0,
+    # actions/upload-artifact@v7, actions/download-artifact@v8) — the repo-wide
+    # convention also used by electron-release.yml / npm-publish.yml. All are
+    # GitHub first-party actions; SHA pinning buys little against a GitHub-side
+    # compromise while adding notable maintenance burden (every @vN bump must
+    # resolve a new SHA). The workflow triggers ONLY on workflow_dispatch (see
+    # the cache-poisoning justification above), so the release job is never
+    # reachable from a fork PR.
+    # Accepted risk (first-party tags on trusted events), re-review at the next
+    # release cycle (added 2026-08-07).
+    ignore:
+      - build-release.yml

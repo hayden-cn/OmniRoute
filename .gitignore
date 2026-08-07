@@ -74,6 +74,8 @@ yarn-error.log*
 !.env.example
 !.env.devin-bridge.example
 !.env.homolog.example
+# Deploy asset shipped inside the release zip (workflow copies scripts/build/ci-assets/*)
+!scripts/build/ci-assets/.env.minimal
 # Provider API keys (never commit)
 *.api-key
 .nvidia-api-key

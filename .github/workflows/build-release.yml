@@ -1,0 +1,242 @@
+name: Build & Publish Windows Release
+
+# Fork-operator release build: builds two standalone Windows bundles on
+# windows-latest (native modules are platform-locked, so the runner must match
+# the deployment target) and publishes them to a GitHub Release.
+#
+# Two independent bundles sharing one DATA_DIR (SQLite WAL is multi-process safe):
+#   • backend   — OMNIROUTE_BUILD_BACKEND_ONLY=1 build (UI stripped, /v1/* only),
+#                 small artifact + low runtime memory (see scripts/build/ci-assets/).
+#   • dashboard — full build (UI + API), started on demand for provider/policy config.
+# Artifacts carry no bundled Node runtime; deployment uses the local `node` and the
+# bundled scripts/build/ci-assets deployment kit (README-DEPLOY.md, .env.minimal,
+# nssm/, verify-health.ps1).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release 版本标签（如 v3.8.50）。留空 = 只上传构建产物，不创建 GitHub Release。"
+        required: false
+        default: ""
+        type: string
+      slim_backend:
+        description: "后端产物瘦身：移除 LLMLingua 可选依赖（压缩功能降级，产物更小）"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+# Least-privilege default: read-only at the top level; only the release job grants
+# the contents write it needs (Scorecard TokenPermissions, same as electron-release).
+permissions:
+  contents: read
+
+concurrency:
+  group: omniroute-windows-release
+  cancel-in-progress: true
+
+env:
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - name: Validate version format
+        id: validate
+        env:
+          # Pass the operator input via env (never interpolate ${{ inputs.* }}
+          # straight into the run: script body) — zizmor template-injection
+          # mitigation. INPUT_VERSION is regex-validated below before use.
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          VERSION="$INPUT_VERSION"
+          if [ -n "$VERSION" ] && [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version format. Expected e.g. v3.8.50"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ -n "$VERSION" ]; then
+            echo "✓ Valid version: $VERSION"
+          else
+            echo "ℹ Build-only run (no version input) — artifacts will be uploaded, no Release created."
+          fi
+
+  build:
+    name: Build ${{ matrix.label }} (win-x64)
+    needs: validate
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: backend
+            next_dist_dir: .build/backend/next
+            backend_only: "1"
+            asset: omniroute-backend-win-x64.zip
+          - label: dashboard
+            next_dist_dir: .build/dashboard/next
+            backend_only: "0"
+            asset: omniroute-dashboard-win-x64.zip
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Cache node_modules
+        uses: actions/cache@v6.1.0
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+        env:
+          NPM_CONFIG_LEGACY_PEER_DEPS: true
+
+      - name: Sanitize Windows home directory
+        shell: bash
+        run: |
+          # The default USERPROFILE contains junction points (Application Data)
+          # that cause EPERM errors during Next.js standalone build glob scans.
+          # Create a clean temp profile directory to avoid this.
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "USERPROFILE=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+
+      - name: Build Next.js standalone (${{ matrix.label }})
+        env:
+          JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
+          NEXT_DIST_DIR: ${{ matrix.next_dist_dir }}
+          OMNIROUTE_BUILD_BACKEND_ONLY: ${{ matrix.backend_only }}
+          OMNIROUTE_BUILD_MEMORY_MB: "6144"
+        run: node scripts/build/build-next-isolated.mjs
+
+      - name: Slim backend bundle (optional LLMLingua prune)
+        if: matrix.label == 'backend' && inputs.slim_backend == 'true'
+        shell: pwsh
+        env:
+          NEXT_DIST_DIR: ${{ matrix.next_dist_dir }}
+        run: |
+          # Post-build prune of the optional LLMLingua closure from the standalone
+          # node_modules. LLMLingua is loaded via dynamic import only (fail-soft at
+          # runtime when absent); js-tiktoken is KEPT because it is statically
+          # imported by src/shared/utils/tiktokenCounter.ts. Removes ~200-300 MB
+          # from the backend artifact.
+          $target = Join-Path $env:NEXT_DIST_DIR "standalone\node_modules"
+          foreach ($pkg in @("@atjsh\llmlingua-2", "@huggingface\transformers", "@tensorflow\tfjs")) {
+            $dir = Join-Path $target $pkg
+            if (Test-Path -LiteralPath $dir) {
+              Remove-Item -LiteralPath $dir -Recurse -Force
+              Write-Host "pruned $pkg"
+            }
+          }
+
+      - name: Stage deploy assets and BUILD_INFO
+        shell: pwsh
+        env:
+          NEXT_DIST_DIR: ${{ matrix.next_dist_dir }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+          MATRIX_LABEL: ${{ matrix.label }}
+          SLIM_BACKEND: ${{ inputs.slim_backend }}
+        run: |
+          $standalone = Join-Path $env:NEXT_DIST_DIR "standalone"
+          if (-not (Test-Path -LiteralPath (Join-Path $standalone "dev\run-standalone.mjs"))) {
+            throw "standalone entry missing: $standalone"
+          }
+          Copy-Item -Path "scripts\build\ci-assets\*" -Destination $standalone -Recurse -Force
+          $nodeVer = node --version
+          $builtUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+          @"
+          version: $env:VERSION
+          profile: $env:MATRIX_LABEL
+          commit: $env:COMMIT_SHA
+          node: $nodeVer
+          built: $builtUtc
+          slim_backend: $env:SLIM_BACKEND
+          "@ | Set-Content -LiteralPath (Join-Path $standalone "BUILD_INFO.txt") -Encoding ascii
+          Write-Host "staged deploy assets into $standalone"
+
+      - name: Package zip
+        shell: pwsh
+        env:
+          NEXT_DIST_DIR: ${{ matrix.next_dist_dir }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          $standalone = Join-Path $env:NEXT_DIST_DIR "standalone"
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path -LiteralPath $sevenZip)) {
+            throw "7-Zip not found at $sevenZip"
+          }
+          & $sevenZip a -tzip -r "$env:ASSET" "$standalone\*"
+          if ($LASTEXITCODE -ne 0) { throw "7z exited $LASTEXITCODE" }
+
+      - name: Generate SHA256 checksum
+        shell: pwsh
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:ASSET).Hash
+          "$hash  $env:ASSET" | Set-Content -LiteralPath "$env:ASSET.sha256" -Encoding ascii
+          Write-Host "SHA256: $hash"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.label }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [validate, build]
+    if: ${{ needs.validate.outputs.version != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create (CLI) creates the GitHub Release
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Consolidate checksums
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -name '*.sha256' -exec sh -c 'cat "$1" >> SHA256SUMS.txt' _ {} \;
+          cp artifacts/*.zip release-assets/
+          ls -la release-assets/ SHA256SUMS.txt
+
+      - name: Create Release
+        env:
+          # version was regex-validated ^v[0-9]+\.[0-9]+\.[0-9]+$ in the validate
+          # job; still passed via env, never interpolated into the script body.
+          INPUT_VERSION: ${{ needs.validate.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$INPUT_VERSION" \
+            release-assets/*.zip SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$INPUT_VERSION" \
+            --generate-notes
